@@ -8,3 +8,5 @@ c63pred
 .*.d
 
 # data files
+*.c63
+*.yuv
