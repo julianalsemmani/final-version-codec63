@@ -5,6 +5,20 @@
 #include "dsp.h"
 #include "tables.h"
 
+#include <arm_neon.h>
+
+static float dctlookupTranspose[8][8] =
+{
+  {1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, },
+  {0.980785f, 0.831470f, 0.555570f, 0.195090f, -0.195090f, -0.555570f, -0.831470f, -0.980785f, },
+  {0.923880f, 0.382683f, -0.382683f, -0.923880f, -0.923880f, -0.382683f, 0.382683f, 0.923880f, },
+  {0.831470f, -0.195090f, -0.980785f, -0.555570f, 0.555570f, 0.980785f, 0.195090f, -0.831470f, },
+  {0.707107f, -0.707107f, -0.707107f, 0.707107f, 0.707107f, -0.707107f, -0.707107f, 0.707107f, },
+  {0.555570f, -0.980785f, 0.195090f, 0.831470f, -0.831470f, -0.195090f, 0.980785f, -0.555570f, },
+  {0.382683f, -0.923880f, 0.923880f, -0.382683f, -0.382683f, 0.923880f, -0.923880f, 0.382683f, },
+  {0.195090f, -0.555570f, 0.831470f, -0.980785f, 0.980785f, -0.831470f, 0.555570f, -0.195090f, },
+};
+
 static void transpose_block(float *in_data, float *out_data)
 {
   int i, j;
@@ -18,38 +32,49 @@ static void transpose_block(float *in_data, float *out_data)
   }
 }
 
-static void dct_1d(float *in_data, float *out_data)
-{
-  int i, j;
+static void dct_1d(float *in_data, float *out_data) {
+  // Set output vectors to zero
+  float32x4_t sumLow = vdupq_n_f32(0.0f);
+  float32x4_t sumHigh = vdupq_n_f32(0.0f);
 
-  for (i = 0; i < 8; ++i)
-  {
-    float dct = 0;
+  for (int i = 0; i < 8; ++i) {
+    // Load current input data element to all four lanes of a NEON register
+    float32x4_t inputValue = vld1q_dup_f32(in_data + i);
 
-    for (j = 0; j < 8; ++j)
-    {
-      dct += in_data[j] * dctlookup[j][i];
-    }
+    // Load the first half of the current row of the lookup table
+    float32x4_t dctLookupLow = vld1q_f32(&dctlookup[i][0]);
+    // Load the second half of the current row of the lookup table
+    float32x4_t dctLookupHigh = vld1q_f32(&dctlookup[i][4]);
 
-    out_data[i] = dct;
+    // Sum
+    sumLow = vmlaq_f32(sumLow, dctLookupLow, inputValue);
+    sumHigh = vmlaq_f32(sumHigh, dctLookupHigh, inputValue);
   }
+
+  // Store the results back to the output array
+  vst1q_f32(out_data, sumLow);
+  vst1q_f32(out_data + 4, sumHigh);
 }
 
-static void idct_1d(float *in_data, float *out_data)
-{
-  int i, j;
+static void idct_1d(float *in_data, float *out_data) {
+    // Set output vectors to zero
+    float32x4_t sumLow = vdupq_n_f32(0.0f);
+    float32x4_t sumHigh = vdupq_n_f32(0.0f);
 
-  for (i = 0; i < 8; ++i)
-  {
-    float idct = 0;
+    for (int i = 0; i < 8; ++i) {
+        // Load the first half of the current row of the lookup transposed table
+        float32x4_t dctLookupLow = vld1q_f32(&dctlookupTranspose[i][0]);
+        // Load the second half of the current row of the lookup transposed table
+        float32x4_t dctLookupHigh = vld1q_f32(&dctlookupTranspose[i][4]);
 
-    for (j = 0; j < 8; ++j)
-    {
-      idct += in_data[j] * dctlookup[i][j];
+        // Sum
+        sumLow = vmlaq_n_f32(sumLow, dctLookupLow, in_data[i]);
+        sumHigh = vmlaq_n_f32(sumHigh, dctLookupHigh, in_data[i]);
     }
 
-    out_data[i] = idct;
-  }
+    // Store the results back to the output array
+    vst1q_f32(&out_data[0], sumLow);
+    vst1q_f32(&out_data[4], sumHigh);
 }
 
 static void scale_block(float *in_data, float *out_data)
@@ -146,17 +171,58 @@ void dequant_idct_block_8x8(int16_t *in_data, int16_t *out_data,
   for (i = 0; i < 64; ++i) { out_data[i] = mb[i]; }
 }
 
-void sad_block_8x8(uint8_t *block1, uint8_t *block2, int stride, int *result)
-{
-  int u, v;
+void sad_block_8x8(uint8_t *block1, uint8_t *block2, int stride, int *result) {
+    // Initialize an empty vector
+    uint16x8_t sum = vdupq_n_u16(0);
 
-  *result = 0;
+    // Row 0
+    uint8x8_t block1_0 = vld1_u8(&block1[0 * stride]);
+    uint8x8_t block2_0 = vld1_u8(&block2[0 * stride]);
+    uint8x8_t abdiff_0 = vabd_u8(block1_0, block2_0);
+    sum = vaddw_u8(sum, abdiff_0);
 
-  for (v = 0; v < 8; ++v)
-  {
-    for (u = 0; u < 8; ++u)
-    {
-      *result += abs(block2[v*stride+u] - block1[v*stride+u]);
-    }
-  }
+    // Row 1
+    uint8x8_t block1_1 = vld1_u8(&block1[1 * stride]);
+    uint8x8_t block2_1 = vld1_u8(&block2[1 * stride]);
+    uint8x8_t abdiff_1 = vabd_u8(block1_1, block2_1);
+    sum = vaddw_u8(sum, abdiff_1);
+
+    // Rows 2
+    uint8x8_t block1_2 = vld1_u8(&block1[2 * stride]);
+    uint8x8_t block2_2 = vld1_u8(&block2[2 * stride]);
+    uint8x8_t abdiff_2 = vabd_u8(block1_2, block2_2);
+    sum = vaddw_u8(sum, abdiff_2);
+
+    // Row 3
+    uint8x8_t block1_3 = vld1_u8(&block1[3 * stride]);
+    uint8x8_t block2_3 = vld1_u8(&block2[3 * stride]);
+    uint8x8_t abdiff_3 = vabd_u8(block1_3, block2_3);
+    sum = vaddw_u8(sum, abdiff_3);
+
+    // Row 4
+    uint8x8_t block1_4 = vld1_u8(&block1[4 * stride]);
+    uint8x8_t block2_4 = vld1_u8(&block2[4 * stride]);
+    uint8x8_t abdiff_4 = vabd_u8(block1_4, block2_4);
+    sum = vaddw_u8(sum, abdiff_4);
+
+    // Row 5
+    uint8x8_t block1_5 = vld1_u8(&block1[5 * stride]);
+    uint8x8_t block2_5 = vld1_u8(&block2[5 * stride]);
+    uint8x8_t abdiff_5 = vabd_u8(block1_5, block2_5);
+    sum = vaddw_u8(sum, abdiff_5);
+
+    // Row 6
+    uint8x8_t block1_6 = vld1_u8(&block1[6 * stride]);
+    uint8x8_t block2_6 = vld1_u8(&block2[6 * stride]);
+    uint8x8_t abdiff_6 = vabd_u8(block1_6, block2_6);
+    sum = vaddw_u8(sum, abdiff_6);
+
+    // Row 7
+    uint8x8_t block1_7 = vld1_u8(&block1[7 * stride]);
+    uint8x8_t block2_7 = vld1_u8(&block2[7 * stride]);
+    uint8x8_t abdiff_7 = vabd_u8(block1_7, block2_7);
+    sum = vaddw_u8(sum, abdiff_7);
+
+    // Add the 8 values in the sum vector together to get the total sum
+    *result = vaddvq_u16(sum);
 }
